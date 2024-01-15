@@ -7,7 +7,7 @@
 # license agreement from NVIDIA CORPORATION & AFFILIATES is strictly prohibited.
 
 logging:
-    exp_name: 'test-kodak-120000'
+    exp_name: 'test-pathology-small-100000'
     log_every: 1000
 
 dataset:
@@ -70,7 +70,7 @@ optimizer:
     weight_decay_decoder: 0.01
 
 trainer:
-    epochs: 120000
+    epochs: 100000
     batch_size: 1
     model_format: 'full'  # If loading a pretrained pipeline, 'full' = torch.load instead of torch.load_state_dict
     valid_every: -1

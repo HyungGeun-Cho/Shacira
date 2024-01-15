@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from torch.utils.tensorboard import SummaryWriter
 from wisp.trainers import BaseTrainer, log_metric_to_wandb, log_images_to_wandb
 from wisp.datasets import BaseImageDataset,ImageBatch, default_collate
-from wisp.ops.image import hwc_to_chw, psnr, clamped_psnr, clamped_mse
+from wisp.ops.image import hwc_to_chw, psnr, clamped_psnr, clamped_mse, ssim
 from wisp.utils.schedulers import DecayScheduler
 from wisp.models.grids import LatentGrid, HashGrid, CodebookOctreeGrid
 from wisp.models.latent_decoders import LatentDecoder, MultiLatentDecoder
@@ -81,6 +81,7 @@ class ImageTrainer(BaseTrainer):
         self.log_dict['rgb_loss'] = 0.0
         self.log_dict['total_loss'] = 0.0
         self.log_dict['PSNR'] = 0.0
+        # self.log_dict['SSIM'] = 0.0
         if self.extra_args["ldecode_enabled"] and self.entropy_reg_lambda > 0:
             self.log_dict['ent_loss'] = 0.0
             self.log_dict['net_kbytes_codebook'] = 0.0
@@ -106,6 +107,7 @@ class ImageTrainer(BaseTrainer):
         This function runs once before training starts.
         """
         self.best_state = {'rgb_loss':np.inf, 'PSNR': 0.0}
+        # self.best_state = {'rgb_loss':np.inf, 'PSNR': 0.0, 'SSIM': 0.0}
         if self.train_dataset.static_coords:
             #  Pointer to hold static data when initialized
             self.data = None
@@ -114,6 +116,7 @@ class ImageTrainer(BaseTrainer):
         """
         This function runs once before the epoch.
         """
+        torch.cuda.empty_cache()
 
         # Data resampling if not static every epoch
         if self.extra_args["resample"] and self.epoch % self.extra_args["resample_every"] == 0 \
@@ -148,11 +151,13 @@ class ImageTrainer(BaseTrainer):
         """
         Runs once after the epoch
         """
+        torch.cuda.empty_cache()
 
         if not self.train_dataset.static_coords:
             self.p_bar.close()
 
         self.log_dict['PSNR'] = self.log_dict['PSNR'] / self.iterations_per_epoch
+        # self.log_dict['SSIM'] = self.log_dict['SSIM'] / self.iterations_per_epoch
         if isinstance(self.pipeline.nef.grid, LatentGrid) or \
             isinstance(self.pipeline.nef.grid, HashGrid) or \
             isinstance(self.pipeline.nef.grid, CodebookOctreeGrid):
@@ -172,6 +177,7 @@ class ImageTrainer(BaseTrainer):
 
         if self.train_dataset.static_coords and self.log_dict['rgb_loss'] < self.best_state['rgb_loss']:
             self.best_state['PSNR'] = self.log_dict['PSNR']
+            # self.best_state['SSIM'] = self.log_dict['SSIM']
             self.best_state['BPP'] = self.log_dict['BPP']
             self.best_state['total_size'] = self.log_dict['total_size']
             self.best_state['rgb_loss'] = self.log_dict['rgb_loss']
@@ -278,6 +284,10 @@ class ImageTrainer(BaseTrainer):
         img_gts = data['rgb'].squeeze(0)
         
         self.optimizer.zero_grad(set_to_none=True)
+
+        
+        # print(self.train_dataset.static_coords) # False
+        # print(data['coords'].shape) # torch.Size([1, 262144, 2])
             
         loss = rgb_loss = 0
 
@@ -300,6 +310,8 @@ class ImageTrainer(BaseTrainer):
         rgb_loss += ((pred - res * img_gts)**2).mean()
 
         self.log_dict['PSNR'] += clamped_psnr(pred, img_gts)
+        # self.log_dict['SSIM'] += ssim(pred, img_gts)
+
         # If coordinates static (single step per epoch), train is same as validation data
         # Best state is stored at end of validation otherwise
         if self.train_dataset.static_coords and rgb_loss < self.best_state['rgb_loss'] and not self.metrics_only:
@@ -377,7 +389,9 @@ class ImageTrainer(BaseTrainer):
     def validate(self):
         """Implement validation. 
         """
-        val_dict = {'MSE':[], 'num_samples': [], 'clamped_MSE': [], 'PSNR': 0.0}
+        torch.cuda.empty_cache()
+        val_dict = {'MSE':[], 'num_samples': [], 'clamped_MSE': [], 'PSNR': []}
+        # val_dict = {'MSE':[], 'num_samples': [], 'clamped_MSE': [], 'PSNR': [], 'SSIM': []}
         val_dataset = self.train_dataset
         sample_mode_state = self.train_dataset.sample_mode
         # val_dataset.sample_mode = 'eval'
@@ -388,6 +402,9 @@ class ImageTrainer(BaseTrainer):
                                             batch_size=self.batch_size,
                                             shuffle=False, pin_memory=False,
                                             num_workers=self.extra_args['dataloader_num_workers'])
+        
+        print(val_data_loader)
+
         iterations_per_epoch = len(val_data_loader)
 
         # For validation, disable SGA annealing if enabled
@@ -416,17 +433,38 @@ class ImageTrainer(BaseTrainer):
             pred = self.pipeline.nef(coords=coords, channels=["rgb"])[0]
             res = 1.0
             rgb_loss = ((pred - res * img_gts)**2).sum()
-            
+
             val_dict['PSNR'] += [clamped_psnr(pred, img_gts)]
+            # val_dict['SSIM'] += [ssim(pred, img_gts)]
+
             val_dict['MSE'] += [rgb_loss.item()]
             val_dict['num_samples'] += [img_gts.size(0)]
-            pred_image[val_dataset.shuffle_idx[coord_idx:coord_idx+coords.size(0)]] = pred.detach().cpu()
+
+            if hasattr(val_dataset, "shuffle_idx"):
+                actual_pixel_idx = val_dataset.shuffle_idx[coord_idx:coord_idx+coords.size(0)]
+            else:
+                actual_pixel_idx = val_dataset.data['coords'][coord_idx:coord_idx+coords.size(0)]
+
+
+            pred_image[actual_pixel_idx] = pred.detach().cpu()
             coord_idx += coords.size(0)
             p_bar.update(1)
         p_bar.close()
         pred_image = torch.clamp(pred_image.reshape(H,W,3)*255,0.,255.).numpy().astype(np.uint8)
         gt_image = torch.clamp(val_dataset.data['orig_rgb'].reshape(H,W,3)*255,0.,255.).numpy().astype(np.uint8)
-        val_dict['PSNR'] = sum(val_dict['PSNR'])/sum(val_dict['num_samples'])
+        # print("PSNR")
+        # print(sum(val_dict['PSNR']))
+        # print(len(val_dict['PSNR']))
+        # print(sum(val_dict['PSNR']) / len(val_dict['PSNR']))
+        # print("MSE")
+        # print(sum(val_dict['MSE']))
+        # print(len(val_dict['MSE']))
+        # print(sum(val_dict['MSE']) / len(val_dict['MSE']))
+        # print("num_samples")
+        # print(val_dict['num_samples'][0])
+        # print(sum(val_dict['num_samples']))
+        # print(len(val_dict['num_samples']))
+        val_dict['PSNR'] = sum(val_dict['PSNR'])/len(val_dict['num_samples'])
         val_dict['MSE'] = sum(val_dict['MSE'])/sum(val_dict['num_samples'])
         if not self.metrics_only:
             val_dict['pred'] = pred_image
@@ -434,6 +472,7 @@ class ImageTrainer(BaseTrainer):
         if not self.train_dataset.static_coords and val_dict['MSE'] < self.best_state['rgb_loss']:
             self.best_state['rgb_loss'] = val_dict['MSE']
             self.best_state['PSNR'] = val_dict['PSNR']
+            # self.best_state['SSIM'] = val_dict['SSIM']
             self.best_state['state_dict'] = copy.deepcopy(self.pipeline.state_dict())
             if not self.metrics_only:
                 self.best_state['pred'] = val_dict['pred']
@@ -443,6 +482,7 @@ class ImageTrainer(BaseTrainer):
 
         log_text = 'Validation Image {}/ {} EPOCH {}/{}'.format(self.train_dataset.image_idx, self.train_dataset.num_images, self.epoch, self.max_epochs)
         log_text += ' | PSNR: {:>.2E}'.format(val_dict['PSNR'])
+        # log_text += ' | SSIM: {:>.2E}'.format(val_dict['SSIM'])
         if isinstance(self.pipeline.nef.grid, LatentGrid) or isinstance(self.pipeline.nef.grid, HashGrid) or isinstance(self.pipeline.nef.grid, CodebookOctreeGrid):
             val_dict['BPP'] = self.log_dict['total_size']*8000/math.prod(val_dataset.image_size)
             log_text += ' | BPP: {:>.2E}'.format(self.log_dict['BPP'])
@@ -456,6 +496,7 @@ class ImageTrainer(BaseTrainer):
 
         if self.using_wandb:
             log_metric_to_wandb(f'image{image_idx}/validation/PSNR',val_dict['PSNR'], self.epoch)
+            # log_metric_to_wandb(f'image{image_idx}/validation/SSIM',val_dict['SSIM'], self.epoch)
             log_metric_to_wandb(f'image{image_idx}/validation/BPP',val_dict['BPP'], self.epoch)
             log_metric_to_wandb(f'image{image_idx}/validation/MSE',val_dict['MSE'], self.epoch)
 
@@ -520,6 +561,7 @@ class ImageTrainer(BaseTrainer):
     def log_cli(self):
         log_text = 'Image {}/ {} EPOCH {}/{}'.format(self.train_dataset.image_idx, self.train_dataset.num_images, self.epoch, self.max_epochs)
         log_text += ' | PSNR: {:>.2E}'.format(self.log_dict['PSNR'])
+        # log_text += ' | SSIM: {:>.2E}'.format(self.log_dict['SSIM'])
         if  isinstance(self.pipeline.nef.grid, LatentGrid) or \
             isinstance(self.pipeline.nef.grid, HashGrid) or \
             isinstance(self.pipeline.nef.grid, CodebookOctreeGrid):

@@ -99,6 +99,8 @@ class LatentGrid(BLASGrid):
 
         offset = 0
         for lod, res in enumerate(resolutions):
+            # increasing lod and res
+            print(res)
             num_pts = res ** resolution_dim
             fts = torch.zeros(min(self.codebook_size, num_pts), self.latent_dim)
             if init_grid == 'uniform':
@@ -109,7 +111,14 @@ class LatentGrid(BLASGrid):
             self.codebook_lod_sizes[lod] = fts.shape[0]
             self.codebook_lod_first_idx[lod] = offset
             offset += fts.shape[0]
+
+            print(fts.shape[0])
+
         self.codebook = nn.Parameter(torch.cat(self.codebook, dim=0))
+
+        # print("Latent Grid")
+        print(self.codebook.shape) # torch.Size([2467043, 1])
+        
         
         self.latent_dec = self.setup_decoders(conf_latent_decoder)
         self.prob_model = None

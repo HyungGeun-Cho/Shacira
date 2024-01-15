@@ -123,8 +123,8 @@ def ssim(rgb, gts):
     assert (rgb.max() <= 1.05 and rgb.min() >= -0.05)
     assert (gts.max() <= 1.05 and gts.min() >= -0.05)
     return skimage.metrics.structural_similarity(
-        rgb[..., :3].cpu().numpy(),
-        gts[..., :3].cpu().numpy(),
+        rgb[..., :3].detach().cpu().numpy(),
+        gts[..., :3].detach().cpu().numpy(),
         multichannel=True,
         data_range=1,
         gaussian_weights=True,
